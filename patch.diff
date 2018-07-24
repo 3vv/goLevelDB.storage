@@ -1,0 +1,2074 @@
+From 82f214b2c574a69559e7bee71aec07200bf854ca Mon Sep 17 00:00:00 2001
+From: h <h@>
+Date: Tue, 24 Jul 2018 13:55:57 +0800
+Subject: [PATCH] Fork goLevelDB/storage
+
+---
+ LICENSE                 |  24 ++
+ file_storage.go         | 671 ++++++++++++++++++++++++++++++++++++++++++++++++
+ file_storage_nacl.go    |  34 +++
+ file_storage_plan9.go   |  63 +++++
+ file_storage_solaris.go |  81 ++++++
+ file_storage_test.go    | 400 +++++++++++++++++++++++++++++
+ file_storage_unix.go    |  98 +++++++
+ file_storage_windows.go |  78 ++++++
+ mem_storage.go          | 222 ++++++++++++++++
+ mem_storage_test.go     | 117 +++++++++
+ storage.go              | 187 ++++++++++++++
+ 11 files changed, 1975 insertions(+)
+ create mode 100644 LICENSE
+ create mode 100644 file_storage.go
+ create mode 100644 file_storage_nacl.go
+ create mode 100644 file_storage_plan9.go
+ create mode 100644 file_storage_solaris.go
+ create mode 100644 file_storage_test.go
+ create mode 100644 file_storage_unix.go
+ create mode 100644 file_storage_windows.go
+ create mode 100644 mem_storage.go
+ create mode 100644 mem_storage_test.go
+ create mode 100644 storage.go
+
+diff --git a/LICENSE b/LICENSE
+new file mode 100644
+index 0000000..4a772d1
+--- /dev/null
++++ b/LICENSE
+@@ -0,0 +1,24 @@
++Copyright 2012 Suryandaru Triandana <syndtr@gmail.com>
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are
++met:
++
++    * Redistributions of source code must retain the above copyright
++notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++notice, this list of conditions and the following disclaimer in the
++documentation and/or other materials provided with the distribution.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+diff --git a/file_storage.go b/file_storage.go
+new file mode 100644
+index 0000000..9ba71fd
+--- /dev/null
++++ b/file_storage.go
+@@ -0,0 +1,671 @@
++// Copyright (c) 2012, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reservefs.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package storage
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"runtime"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++var (
++	errFileOpen = errors.New("leveldb/storage: file still open")
++	errReadOnly = errors.New("leveldb/storage: storage is read-only")
++)
++
++type fileLock interface {
++	release() error
++}
++
++type fileStorageLock struct {
++	fs *fileStorage
++}
++
++func (lock *fileStorageLock) Unlock() {
++	if lock.fs != nil {
++		lock.fs.mu.Lock()
++		defer lock.fs.mu.Unlock()
++		if lock.fs.slock == lock {
++			lock.fs.slock = nil
++		}
++	}
++}
++
++type int64Slice []int64
++
++func (p int64Slice) Len() int           { return len(p) }
++func (p int64Slice) Less(i, j int) bool { return p[i] < p[j] }
++func (p int64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
++
++func writeFileSynced(filename string, data []byte, perm os.FileMode) error {
++	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
++	if err != nil {
++		return err
++	}
++	n, err := f.Write(data)
++	if err == nil && n < len(data) {
++		err = io.ErrShortWrite
++	}
++	if err1 := f.Sync(); err == nil {
++		err = err1
++	}
++	if err1 := f.Close(); err == nil {
++		err = err1
++	}
++	return err
++}
++
++const logSizeThreshold = 1024 * 1024 // 1 MiB
++
++// fileStorage is a file-system backed storage.
++type fileStorage struct {
++	path     string
++	readOnly bool
++
++	mu      sync.Mutex
++	flock   fileLock
++	slock   *fileStorageLock
++	logw    *os.File
++	logSize int64
++	buf     []byte
++	// Opened file counter; if open < 0 means closed.
++	open int
++	day  int
++}
++
++// OpenFile returns a new filesystem-backed storage implementation with the given
++// path. This also acquire a file lock, so any subsequent attempt to open the
++// same path will fail.
++//
++// The storage must be closed after use, by calling Close method.
++func OpenFile(path string, readOnly bool) (Storage, error) {
++	if fi, err := os.Stat(path); err == nil {
++		if !fi.IsDir() {
++			return nil, fmt.Errorf("leveldb/storage: open %s: not a directory", path)
++		}
++	} else if os.IsNotExist(err) && !readOnly {
++		if err := os.MkdirAll(path, 0755); err != nil {
++			return nil, err
++		}
++	} else {
++		return nil, err
++	}
++
++	flock, err := newFileLock(filepath.Join(path, "LOCK"), readOnly)
++	if err != nil {
++		return nil, err
++	}
++
++	defer func() {
++		if err != nil {
++			flock.release()
++		}
++	}()
++
++	var (
++		logw    *os.File
++		logSize int64
++	)
++	if !readOnly {
++		logw, err = os.OpenFile(filepath.Join(path, "LOG"), os.O_WRONLY|os.O_CREATE, 0644)
++		if err != nil {
++			return nil, err
++		}
++		logSize, err = logw.Seek(0, os.SEEK_END)
++		if err != nil {
++			logw.Close()
++			return nil, err
++		}
++	}
++
++	fs := &fileStorage{
++		path:     path,
++		readOnly: readOnly,
++		flock:    flock,
++		logw:     logw,
++		logSize:  logSize,
++	}
++	runtime.SetFinalizer(fs, (*fileStorage).Close)
++	return fs, nil
++}
++
++func (fs *fileStorage) Lock() (Locker, error) {
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return nil, ErrClosed
++	}
++	if fs.readOnly {
++		return &fileStorageLock{}, nil
++	}
++	if fs.slock != nil {
++		return nil, ErrLocked
++	}
++	fs.slock = &fileStorageLock{fs: fs}
++	return fs.slock, nil
++}
++
++func itoa(buf []byte, i int, wid int) []byte {
++	u := uint(i)
++	if u == 0 && wid <= 1 {
++		return append(buf, '0')
++	}
++
++	// Assemble decimal in reverse order.
++	var b [32]byte
++	bp := len(b)
++	for ; u > 0 || wid > 0; u /= 10 {
++		bp--
++		wid--
++		b[bp] = byte(u%10) + '0'
++	}
++	return append(buf, b[bp:]...)
++}
++
++func (fs *fileStorage) printDay(t time.Time) {
++	if fs.day == t.Day() {
++		return
++	}
++	fs.day = t.Day()
++	fs.logw.Write([]byte("=============== " + t.Format("Jan 2, 2006 (MST)") + " ===============\n"))
++}
++
++func (fs *fileStorage) doLog(t time.Time, str string) {
++	if fs.logSize > logSizeThreshold {
++		// Rotate log file.
++		fs.logw.Close()
++		fs.logw = nil
++		fs.logSize = 0
++		rename(filepath.Join(fs.path, "LOG"), filepath.Join(fs.path, "LOG.old"))
++	}
++	if fs.logw == nil {
++		var err error
++		fs.logw, err = os.OpenFile(filepath.Join(fs.path, "LOG"), os.O_WRONLY|os.O_CREATE, 0644)
++		if err != nil {
++			return
++		}
++		// Force printDay on new log file.
++		fs.day = 0
++	}
++	fs.printDay(t)
++	hour, min, sec := t.Clock()
++	msec := t.Nanosecond() / 1e3
++	// time
++	fs.buf = itoa(fs.buf[:0], hour, 2)
++	fs.buf = append(fs.buf, ':')
++	fs.buf = itoa(fs.buf, min, 2)
++	fs.buf = append(fs.buf, ':')
++	fs.buf = itoa(fs.buf, sec, 2)
++	fs.buf = append(fs.buf, '.')
++	fs.buf = itoa(fs.buf, msec, 6)
++	fs.buf = append(fs.buf, ' ')
++	// write
++	fs.buf = append(fs.buf, []byte(str)...)
++	fs.buf = append(fs.buf, '\n')
++	n, _ := fs.logw.Write(fs.buf)
++	fs.logSize += int64(n)
++}
++
++func (fs *fileStorage) Log(str string) {
++	if !fs.readOnly {
++		t := time.Now()
++		fs.mu.Lock()
++		defer fs.mu.Unlock()
++		if fs.open < 0 {
++			return
++		}
++		fs.doLog(t, str)
++	}
++}
++
++func (fs *fileStorage) log(str string) {
++	if !fs.readOnly {
++		fs.doLog(time.Now(), str)
++	}
++}
++
++func (fs *fileStorage) setMeta(fd FileDesc) error {
++	content := fsGenName(fd) + "\n"
++	// Check and backup old CURRENT file.
++	currentPath := filepath.Join(fs.path, "CURRENT")
++	if _, err := os.Stat(currentPath); err == nil {
++		b, err := ioutil.ReadFile(currentPath)
++		if err != nil {
++			fs.log(fmt.Sprintf("backup CURRENT: %v", err))
++			return err
++		}
++		if string(b) == content {
++			// Content not changed, do nothing.
++			return nil
++		}
++		if err := writeFileSynced(currentPath+".bak", b, 0644); err != nil {
++			fs.log(fmt.Sprintf("backup CURRENT: %v", err))
++			return err
++		}
++	} else if !os.IsNotExist(err) {
++		return err
++	}
++	path := fmt.Sprintf("%s.%d", filepath.Join(fs.path, "CURRENT"), fd.Num)
++	if err := writeFileSynced(path, []byte(content), 0644); err != nil {
++		fs.log(fmt.Sprintf("create CURRENT.%d: %v", fd.Num, err))
++		return err
++	}
++	// Replace CURRENT file.
++	if err := rename(path, currentPath); err != nil {
++		fs.log(fmt.Sprintf("rename CURRENT.%d: %v", fd.Num, err))
++		return err
++	}
++	// Sync root directory.
++	if err := syncDir(fs.path); err != nil {
++		fs.log(fmt.Sprintf("syncDir: %v", err))
++		return err
++	}
++	return nil
++}
++
++func (fs *fileStorage) SetMeta(fd FileDesc) error {
++	if !FileDescOk(fd) {
++		return ErrInvalidFile
++	}
++	if fs.readOnly {
++		return errReadOnly
++	}
++
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return ErrClosed
++	}
++	return fs.setMeta(fd)
++}
++
++func (fs *fileStorage) GetMeta() (FileDesc, error) {
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return FileDesc{}, ErrClosed
++	}
++	dir, err := os.Open(fs.path)
++	if err != nil {
++		return FileDesc{}, err
++	}
++	names, err := dir.Readdirnames(0)
++	// Close the dir first before checking for Readdirnames error.
++	if ce := dir.Close(); ce != nil {
++		fs.log(fmt.Sprintf("close dir: %v", ce))
++	}
++	if err != nil {
++		return FileDesc{}, err
++	}
++	// Try this in order:
++	// - CURRENT.[0-9]+ ('pending rename' file, descending order)
++	// - CURRENT
++	// - CURRENT.bak
++	//
++	// Skip corrupted file or file that point to a missing target file.
++	type currentFile struct {
++		name string
++		fd   FileDesc
++	}
++	tryCurrent := func(name string) (*currentFile, error) {
++		b, err := ioutil.ReadFile(filepath.Join(fs.path, name))
++		if err != nil {
++			if os.IsNotExist(err) {
++				err = os.ErrNotExist
++			}
++			return nil, err
++		}
++		var fd FileDesc
++		if len(b) < 1 || b[len(b)-1] != '\n' || !fsParseNamePtr(string(b[:len(b)-1]), &fd) {
++			fs.log(fmt.Sprintf("%s: corrupted content: %q", name, b))
++			err := &ErrCorrupted{
++				Err: errors.New("leveldb/storage: corrupted or incomplete CURRENT file"),
++			}
++			return nil, err
++		}
++		if _, err := os.Stat(filepath.Join(fs.path, fsGenName(fd))); err != nil {
++			if os.IsNotExist(err) {
++				fs.log(fmt.Sprintf("%s: missing target file: %s", name, fd))
++				err = os.ErrNotExist
++			}
++			return nil, err
++		}
++		return &currentFile{name: name, fd: fd}, nil
++	}
++	tryCurrents := func(names []string) (*currentFile, error) {
++		var (
++			cur *currentFile
++			// Last corruption error.
++			lastCerr error
++		)
++		for _, name := range names {
++			var err error
++			cur, err = tryCurrent(name)
++			if err == nil {
++				break
++			} else if err == os.ErrNotExist {
++				// Fallback to the next file.
++			} else if isCorrupted(err) {
++				lastCerr = err
++				// Fallback to the next file.
++			} else {
++				// In case the error is due to permission, etc.
++				return nil, err
++			}
++		}
++		if cur == nil {
++			err := os.ErrNotExist
++			if lastCerr != nil {
++				err = lastCerr
++			}
++			return nil, err
++		}
++		return cur, nil
++	}
++
++	// Try 'pending rename' files.
++	var nums []int64
++	for _, name := range names {
++		if strings.HasPrefix(name, "CURRENT.") && name != "CURRENT.bak" {
++			i, err := strconv.ParseInt(name[8:], 10, 64)
++			if err == nil {
++				nums = append(nums, i)
++			}
++		}
++	}
++	var (
++		pendCur   *currentFile
++		pendErr   = os.ErrNotExist
++		pendNames []string
++	)
++	if len(nums) > 0 {
++		sort.Sort(sort.Reverse(int64Slice(nums)))
++		pendNames = make([]string, len(nums))
++		for i, num := range nums {
++			pendNames[i] = fmt.Sprintf("CURRENT.%d", num)
++		}
++		pendCur, pendErr = tryCurrents(pendNames)
++		if pendErr != nil && pendErr != os.ErrNotExist && !isCorrupted(pendErr) {
++			return FileDesc{}, pendErr
++		}
++	}
++
++	// Try CURRENT and CURRENT.bak.
++	curCur, curErr := tryCurrents([]string{"CURRENT", "CURRENT.bak"})
++	if curErr != nil && curErr != os.ErrNotExist && !isCorrupted(curErr) {
++		return FileDesc{}, curErr
++	}
++
++	// pendCur takes precedence, but guards against obsolete pendCur.
++	if pendCur != nil && (curCur == nil || pendCur.fd.Num > curCur.fd.Num) {
++		curCur = pendCur
++	}
++
++	if curCur != nil {
++		// Restore CURRENT file to proper state.
++		if !fs.readOnly && (curCur.name != "CURRENT" || len(pendNames) != 0) {
++			// Ignore setMeta errors, however don't delete obsolete files if we
++			// catch error.
++			if err := fs.setMeta(curCur.fd); err == nil {
++				// Remove 'pending rename' files.
++				for _, name := range pendNames {
++					if err := os.Remove(filepath.Join(fs.path, name)); err != nil {
++						fs.log(fmt.Sprintf("remove %s: %v", name, err))
++					}
++				}
++			}
++		}
++		return curCur.fd, nil
++	}
++
++	// Nothing found.
++	if isCorrupted(pendErr) {
++		return FileDesc{}, pendErr
++	}
++	return FileDesc{}, curErr
++}
++
++func (fs *fileStorage) List(ft FileType) (fds []FileDesc, err error) {
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return nil, ErrClosed
++	}
++	dir, err := os.Open(fs.path)
++	if err != nil {
++		return
++	}
++	names, err := dir.Readdirnames(0)
++	// Close the dir first before checking for Readdirnames error.
++	if cerr := dir.Close(); cerr != nil {
++		fs.log(fmt.Sprintf("close dir: %v", cerr))
++	}
++	if err == nil {
++		for _, name := range names {
++			if fd, ok := fsParseName(name); ok && fd.Type&ft != 0 {
++				fds = append(fds, fd)
++			}
++		}
++	}
++	return
++}
++
++func (fs *fileStorage) Open(fd FileDesc) (Reader, error) {
++	if !FileDescOk(fd) {
++		return nil, ErrInvalidFile
++	}
++
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return nil, ErrClosed
++	}
++	of, err := os.OpenFile(filepath.Join(fs.path, fsGenName(fd)), os.O_RDONLY, 0)
++	if err != nil {
++		if fsHasOldName(fd) && os.IsNotExist(err) {
++			of, err = os.OpenFile(filepath.Join(fs.path, fsGenOldName(fd)), os.O_RDONLY, 0)
++			if err == nil {
++				goto ok
++			}
++		}
++		return nil, err
++	}
++ok:
++	fs.open++
++	return &fileWrap{File: of, fs: fs, fd: fd}, nil
++}
++
++func (fs *fileStorage) Create(fd FileDesc) (Writer, error) {
++	if !FileDescOk(fd) {
++		return nil, ErrInvalidFile
++	}
++	if fs.readOnly {
++		return nil, errReadOnly
++	}
++
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return nil, ErrClosed
++	}
++	of, err := os.OpenFile(filepath.Join(fs.path, fsGenName(fd)), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
++	if err != nil {
++		return nil, err
++	}
++	fs.open++
++	return &fileWrap{File: of, fs: fs, fd: fd}, nil
++}
++
++func (fs *fileStorage) Remove(fd FileDesc) error {
++	if !FileDescOk(fd) {
++		return ErrInvalidFile
++	}
++	if fs.readOnly {
++		return errReadOnly
++	}
++
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return ErrClosed
++	}
++	err := os.Remove(filepath.Join(fs.path, fsGenName(fd)))
++	if err != nil {
++		if fsHasOldName(fd) && os.IsNotExist(err) {
++			if e1 := os.Remove(filepath.Join(fs.path, fsGenOldName(fd))); !os.IsNotExist(e1) {
++				fs.log(fmt.Sprintf("remove %s: %v (old name)", fd, err))
++				err = e1
++			}
++		} else {
++			fs.log(fmt.Sprintf("remove %s: %v", fd, err))
++		}
++	}
++	return err
++}
++
++func (fs *fileStorage) Rename(oldfd, newfd FileDesc) error {
++	if !FileDescOk(oldfd) || !FileDescOk(newfd) {
++		return ErrInvalidFile
++	}
++	if oldfd == newfd {
++		return nil
++	}
++	if fs.readOnly {
++		return errReadOnly
++	}
++
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return ErrClosed
++	}
++	return rename(filepath.Join(fs.path, fsGenName(oldfd)), filepath.Join(fs.path, fsGenName(newfd)))
++}
++
++func (fs *fileStorage) Close() error {
++	fs.mu.Lock()
++	defer fs.mu.Unlock()
++	if fs.open < 0 {
++		return ErrClosed
++	}
++	// Clear the finalizer.
++	runtime.SetFinalizer(fs, nil)
++
++	if fs.open > 0 {
++		fs.log(fmt.Sprintf("close: warning, %d files still open", fs.open))
++	}
++	fs.open = -1
++	if fs.logw != nil {
++		fs.logw.Close()
++	}
++	return fs.flock.release()
++}
++
++type fileWrap struct {
++	*os.File
++	fs     *fileStorage
++	fd     FileDesc
++	closed bool
++}
++
++func (fw *fileWrap) Sync() error {
++	if err := fw.File.Sync(); err != nil {
++		return err
++	}
++	if fw.fd.Type == TypeManifest {
++		// Also sync parent directory if file type is manifest.
++		// See: https://code.google.com/p/leveldb/issues/detail?id=190.
++		if err := syncDir(fw.fs.path); err != nil {
++			fw.fs.log(fmt.Sprintf("syncDir: %v", err))
++			return err
++		}
++	}
++	return nil
++}
++
++func (fw *fileWrap) Close() error {
++	fw.fs.mu.Lock()
++	defer fw.fs.mu.Unlock()
++	if fw.closed {
++		return ErrClosed
++	}
++	fw.closed = true
++	fw.fs.open--
++	err := fw.File.Close()
++	if err != nil {
++		fw.fs.log(fmt.Sprintf("close %s: %v", fw.fd, err))
++	}
++	return err
++}
++
++func fsGenName(fd FileDesc) string {
++	switch fd.Type {
++	case TypeManifest:
++		return fmt.Sprintf("MANIFEST-%06d", fd.Num)
++	case TypeJournal:
++		return fmt.Sprintf("%06d.log", fd.Num)
++	case TypeTable:
++		return fmt.Sprintf("%06d.ldb", fd.Num)
++	case TypeTemp:
++		return fmt.Sprintf("%06d.tmp", fd.Num)
++	default:
++		panic("invalid file type")
++	}
++}
++
++func fsHasOldName(fd FileDesc) bool {
++	return fd.Type == TypeTable
++}
++
++func fsGenOldName(fd FileDesc) string {
++	switch fd.Type {
++	case TypeTable:
++		return fmt.Sprintf("%06d.sst", fd.Num)
++	}
++	return fsGenName(fd)
++}
++
++func fsParseName(name string) (fd FileDesc, ok bool) {
++	var tail string
++	_, err := fmt.Sscanf(name, "%d.%s", &fd.Num, &tail)
++	if err == nil {
++		switch tail {
++		case "log":
++			fd.Type = TypeJournal
++		case "ldb", "sst":
++			fd.Type = TypeTable
++		case "tmp":
++			fd.Type = TypeTemp
++		default:
++			return
++		}
++		return fd, true
++	}
++	n, _ := fmt.Sscanf(name, "MANIFEST-%d%s", &fd.Num, &tail)
++	if n == 1 {
++		fd.Type = TypeManifest
++		return fd, true
++	}
++	return
++}
++
++func fsParseNamePtr(name string, fd *FileDesc) bool {
++	_fd, ok := fsParseName(name)
++	if fd != nil {
++		*fd = _fd
++	}
++	return ok
++}
+diff --git a/file_storage_nacl.go b/file_storage_nacl.go
+new file mode 100644
+index 0000000..5545aee
+--- /dev/null
++++ b/file_storage_nacl.go
+@@ -0,0 +1,34 @@
++// Copyright (c) 2012, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// +build nacl
++
++package storage
++
++import (
++	"os"
++	"syscall"
++)
++
++func newFileLock(path string, readOnly bool) (fl fileLock, err error) {
++	return nil, syscall.ENOTSUP
++}
++
++func setFileLock(f *os.File, readOnly, lock bool) error {
++	return syscall.ENOTSUP
++}
++
++func rename(oldpath, newpath string) error {
++	return syscall.ENOTSUP
++}
++
++func isErrInvalid(err error) bool {
++	return false
++}
++
++func syncDir(name string) error {
++	return syscall.ENOTSUP
++}
+diff --git a/file_storage_plan9.go b/file_storage_plan9.go
+new file mode 100644
+index 0000000..b829798
+--- /dev/null
++++ b/file_storage_plan9.go
+@@ -0,0 +1,63 @@
++// Copyright (c) 2012, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package storage
++
++import (
++	"os"
++)
++
++type plan9FileLock struct {
++	f *os.File
++}
++
++func (fl *plan9FileLock) release() error {
++	return fl.f.Close()
++}
++
++func newFileLock(path string, readOnly bool) (fl fileLock, err error) {
++	var (
++		flag int
++		perm os.FileMode
++	)
++	if readOnly {
++		flag = os.O_RDONLY
++	} else {
++		flag = os.O_RDWR
++		perm = os.ModeExclusive
++	}
++	f, err := os.OpenFile(path, flag, perm)
++	if os.IsNotExist(err) {
++		f, err = os.OpenFile(path, flag|os.O_CREATE, perm|0644)
++	}
++	if err != nil {
++		return
++	}
++	fl = &plan9FileLock{f: f}
++	return
++}
++
++func rename(oldpath, newpath string) error {
++	if _, err := os.Stat(newpath); err == nil {
++		if err := os.Remove(newpath); err != nil {
++			return err
++		}
++	}
++
++	return os.Rename(oldpath, newpath)
++}
++
++func syncDir(name string) error {
++	f, err := os.Open(name)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	if err := f.Sync(); err != nil {
++		return err
++	}
++	return nil
++}
+diff --git a/file_storage_solaris.go b/file_storage_solaris.go
+new file mode 100644
+index 0000000..79901ee
+--- /dev/null
++++ b/file_storage_solaris.go
+@@ -0,0 +1,81 @@
++// Copyright (c) 2012, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// +build solaris
++
++package storage
++
++import (
++	"os"
++	"syscall"
++)
++
++type unixFileLock struct {
++	f *os.File
++}
++
++func (fl *unixFileLock) release() error {
++	if err := setFileLock(fl.f, false, false); err != nil {
++		return err
++	}
++	return fl.f.Close()
++}
++
++func newFileLock(path string, readOnly bool) (fl fileLock, err error) {
++	var flag int
++	if readOnly {
++		flag = os.O_RDONLY
++	} else {
++		flag = os.O_RDWR
++	}
++	f, err := os.OpenFile(path, flag, 0)
++	if os.IsNotExist(err) {
++		f, err = os.OpenFile(path, flag|os.O_CREATE, 0644)
++	}
++	if err != nil {
++		return
++	}
++	err = setFileLock(f, readOnly, true)
++	if err != nil {
++		f.Close()
++		return
++	}
++	fl = &unixFileLock{f: f}
++	return
++}
++
++func setFileLock(f *os.File, readOnly, lock bool) error {
++	flock := syscall.Flock_t{
++		Type:   syscall.F_UNLCK,
++		Start:  0,
++		Len:    0,
++		Whence: 1,
++	}
++	if lock {
++		if readOnly {
++			flock.Type = syscall.F_RDLCK
++		} else {
++			flock.Type = syscall.F_WRLCK
++		}
++	}
++	return syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &flock)
++}
++
++func rename(oldpath, newpath string) error {
++	return os.Rename(oldpath, newpath)
++}
++
++func syncDir(name string) error {
++	f, err := os.Open(name)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	if err := f.Sync(); err != nil {
++		return err
++	}
++	return nil
++}
+diff --git a/file_storage_test.go b/file_storage_test.go
+new file mode 100644
+index 0000000..2e60315
+--- /dev/null
++++ b/file_storage_test.go
+@@ -0,0 +1,400 @@
++// Copyright (c) 2012, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package storage
++
++import (
++	"fmt"
++	"io/ioutil"
++	"math/rand"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++var cases = []struct {
++	oldName []string
++	name    string
++	ftype   FileType
++	num     int64
++}{
++	{nil, "000100.log", TypeJournal, 100},
++	{nil, "000000.log", TypeJournal, 0},
++	{[]string{"000000.sst"}, "000000.ldb", TypeTable, 0},
++	{nil, "MANIFEST-000002", TypeManifest, 2},
++	{nil, "MANIFEST-000007", TypeManifest, 7},
++	{nil, "9223372036854775807.log", TypeJournal, 9223372036854775807},
++	{nil, "000100.tmp", TypeTemp, 100},
++}
++
++var invalidCases = []string{
++	"",
++	"foo",
++	"foo-dx-100.log",
++	".log",
++	"",
++	"manifest",
++	"CURREN",
++	"CURRENTX",
++	"MANIFES",
++	"MANIFEST",
++	"MANIFEST-",
++	"XMANIFEST-3",
++	"MANIFEST-3x",
++	"LOC",
++	"LOCKx",
++	"LO",
++	"LOGx",
++	"18446744073709551616.log",
++	"184467440737095516150.log",
++	"100",
++	"100.",
++	"100.lop",
++}
++
++func tempDir(t *testing.T) string {
++	dir, err := ioutil.TempDir("", "goleveldb-")
++	if err != nil {
++		t.Fatal(t)
++	}
++	t.Log("Using temp-dir:", dir)
++	return dir
++}
++
++func TestFileStorage_CreateFileName(t *testing.T) {
++	for _, c := range cases {
++		if name := fsGenName(FileDesc{c.ftype, c.num}); name != c.name {
++			t.Errorf("invalid filename got '%s', want '%s'", name, c.name)
++		}
++	}
++}
++
++func TestFileStorage_MetaSetGet(t *testing.T) {
++	temp := tempDir(t)
++	fs, err := OpenFile(temp, false)
++	if err != nil {
++		t.Fatal("OpenFile: got error: ", err)
++	}
++
++	for i := 0; i < 10; i++ {
++		num := rand.Int63()
++		fd := FileDesc{Type: TypeManifest, Num: num}
++		w, err := fs.Create(fd)
++		if err != nil {
++			t.Fatalf("Create(%d): got error: %v", i, err)
++		}
++		w.Write([]byte("TEST"))
++		w.Close()
++		if err := fs.SetMeta(fd); err != nil {
++			t.Fatalf("SetMeta(%d): got error: %v", i, err)
++		}
++		rfd, err := fs.GetMeta()
++		if err != nil {
++			t.Fatalf("GetMeta(%d): got error: %v", i, err)
++		}
++		if fd != rfd {
++			t.Fatalf("Invalid meta (%d): got '%s', want '%s'", i, rfd, fd)
++		}
++	}
++	os.RemoveAll(temp)
++}
++
++func TestFileStorage_Meta(t *testing.T) {
++	type current struct {
++		num      int64
++		backup   bool
++		current  bool
++		manifest bool
++		corrupt  bool
++	}
++	type testCase struct {
++		currents []current
++		notExist bool
++		corrupt  bool
++		expect   int64
++	}
++	cases := []testCase{
++		{
++			currents: []current{
++				{num: 2, backup: true, manifest: true},
++				{num: 1, current: true},
++			},
++			expect: 2,
++		},
++		{
++			currents: []current{
++				{num: 2, backup: true, manifest: true},
++				{num: 1, current: true, manifest: true},
++			},
++			expect: 1,
++		},
++		{
++			currents: []current{
++				{num: 2, manifest: true},
++				{num: 3, manifest: true},
++				{num: 4, current: true, manifest: true},
++			},
++			expect: 4,
++		},
++		{
++			currents: []current{
++				{num: 2, manifest: true},
++				{num: 3, manifest: true},
++				{num: 4, current: true, manifest: true, corrupt: true},
++			},
++			expect: 3,
++		},
++		{
++			currents: []current{
++				{num: 2, manifest: true},
++				{num: 3, manifest: true},
++				{num: 5, current: true, manifest: true, corrupt: true},
++				{num: 4, backup: true, manifest: true},
++			},
++			expect: 4,
++		},
++		{
++			currents: []current{
++				{num: 4, manifest: true},
++				{num: 3, manifest: true},
++				{num: 2, current: true, manifest: true},
++			},
++			expect: 4,
++		},
++		{
++			currents: []current{
++				{num: 4, manifest: true, corrupt: true},
++				{num: 3, manifest: true},
++				{num: 2, current: true, manifest: true},
++			},
++			expect: 3,
++		},
++		{
++			currents: []current{
++				{num: 4, manifest: true, corrupt: true},
++				{num: 3, manifest: true, corrupt: true},
++				{num: 2, current: true, manifest: true},
++			},
++			expect: 2,
++		},
++		{
++			currents: []current{
++				{num: 4},
++				{num: 3, manifest: true},
++				{num: 2, current: true, manifest: true},
++			},
++			expect: 3,
++		},
++		{
++			currents: []current{
++				{num: 4},
++				{num: 3, manifest: true},
++				{num: 6, current: true},
++				{num: 5, backup: true, manifest: true},
++			},
++			expect: 5,
++		},
++		{
++			currents: []current{
++				{num: 4},
++				{num: 3},
++				{num: 6, current: true},
++				{num: 5, backup: true},
++			},
++			notExist: true,
++		},
++		{
++			currents: []current{
++				{num: 4, corrupt: true},
++				{num: 3},
++				{num: 6, current: true},
++				{num: 5, backup: true},
++			},
++			corrupt: true,
++		},
++	}
++	for i, tc := range cases {
++		t.Logf("Test-%d", i)
++		temp := tempDir(t)
++		fs, err := OpenFile(temp, false)
++		if err != nil {
++			t.Fatal("OpenFile: got error: ", err)
++		}
++		for _, cur := range tc.currents {
++			var curName string
++			switch {
++			case cur.current:
++				curName = "CURRENT"
++			case cur.backup:
++				curName = "CURRENT.bak"
++			default:
++				curName = fmt.Sprintf("CURRENT.%d", cur.num)
++			}
++			fd := FileDesc{Type: TypeManifest, Num: cur.num}
++			content := fmt.Sprintf("%s\n", fsGenName(fd))
++			if cur.corrupt {
++				content = content[:len(content)-1-rand.Intn(3)]
++			}
++			if err := ioutil.WriteFile(filepath.Join(temp, curName), []byte(content), 0644); err != nil {
++				t.Fatal(err)
++			}
++			if cur.manifest {
++				w, err := fs.Create(fd)
++				if err != nil {
++					t.Fatal(err)
++				}
++				if _, err := w.Write([]byte("TEST")); err != nil {
++					t.Fatal(err)
++				}
++				w.Close()
++			}
++		}
++		ret, err := fs.GetMeta()
++		if tc.notExist {
++			if err != os.ErrNotExist {
++				t.Fatalf("expect ErrNotExist, got: %v", err)
++			}
++		} else if tc.corrupt {
++			if !isCorrupted(err) {
++				t.Fatalf("expect ErrCorrupted, got: %v", err)
++			}
++		} else {
++			if err != nil {
++				t.Fatal(err)
++			}
++			if ret.Type != TypeManifest {
++				t.Fatalf("expecting manifest, got: %s", ret.Type)
++			}
++			if ret.Num != tc.expect {
++				t.Fatalf("invalid num, expect=%d got=%d", tc.expect, ret.Num)
++			}
++			fis, err := ioutil.ReadDir(temp)
++			if err != nil {
++				t.Fatal(err)
++			}
++			for _, fi := range fis {
++				if strings.HasPrefix(fi.Name(), "CURRENT") {
++					switch fi.Name() {
++					case "CURRENT", "CURRENT.bak":
++					default:
++						t.Fatalf("found rouge CURRENT file: %s", fi.Name())
++					}
++				}
++				t.Logf("-> %s", fi.Name())
++			}
++		}
++		os.RemoveAll(temp)
++	}
++}
++
++func TestFileStorage_ParseFileName(t *testing.T) {
++	for _, c := range cases {
++		for _, name := range append([]string{c.name}, c.oldName...) {
++			fd, ok := fsParseName(name)
++			if !ok {
++				t.Errorf("cannot parse filename '%s'", name)
++				continue
++			}
++			if fd.Type != c.ftype {
++				t.Errorf("filename '%s' invalid type got '%d', want '%d'", name, fd.Type, c.ftype)
++			}
++			if fd.Num != c.num {
++				t.Errorf("filename '%s' invalid number got '%d', want '%d'", name, fd.Num, c.num)
++			}
++		}
++	}
++}
++
++func TestFileStorage_InvalidFileName(t *testing.T) {
++	for _, name := range invalidCases {
++		if fsParseNamePtr(name, nil) {
++			t.Errorf("filename '%s' should be invalid", name)
++		}
++	}
++}
++
++func TestFileStorage_Locking(t *testing.T) {
++	temp := tempDir(t)
++	defer os.RemoveAll(temp)
++
++	p1, err := OpenFile(temp, false)
++	if err != nil {
++		t.Fatal("OpenFile(1): got error: ", err)
++	}
++
++	p2, err := OpenFile(temp, false)
++	if err != nil {
++		t.Logf("OpenFile(2): got error: %s (expected)", err)
++	} else {
++		p2.Close()
++		p1.Close()
++		t.Fatal("OpenFile(2): expect error")
++	}
++
++	p1.Close()
++
++	p3, err := OpenFile(temp, false)
++	if err != nil {
++		t.Fatal("OpenFile(3): got error: ", err)
++	}
++	defer p3.Close()
++
++	l, err := p3.Lock()
++	if err != nil {
++		t.Fatal("storage lock failed(1): ", err)
++	}
++	_, err = p3.Lock()
++	if err == nil {
++		t.Fatal("expect error for second storage lock attempt")
++	} else {
++		t.Logf("storage lock got error: %s (expected)", err)
++	}
++	l.Unlock()
++	_, err = p3.Lock()
++	if err != nil {
++		t.Fatal("storage lock failed(2): ", err)
++	}
++}
++
++func TestFileStorage_ReadOnlyLocking(t *testing.T) {
++	temp := tempDir(t)
++	defer os.RemoveAll(temp)
++
++	p1, err := OpenFile(temp, false)
++	if err != nil {
++		t.Fatal("OpenFile(1): got error: ", err)
++	}
++
++	_, err = OpenFile(temp, true)
++	if err != nil {
++		t.Logf("OpenFile(2): got error: %s (expected)", err)
++	} else {
++		t.Fatal("OpenFile(2): expect error")
++	}
++
++	p1.Close()
++
++	p3, err := OpenFile(temp, true)
++	if err != nil {
++		t.Fatal("OpenFile(3): got error: ", err)
++	}
++
++	p4, err := OpenFile(temp, true)
++	if err != nil {
++		t.Fatal("OpenFile(4): got error: ", err)
++	}
++
++	_, err = OpenFile(temp, false)
++	if err != nil {
++		t.Logf("OpenFile(5): got error: %s (expected)", err)
++	} else {
++		t.Fatal("OpenFile(2): expect error")
++	}
++
++	p3.Close()
++	p4.Close()
++}
+diff --git a/file_storage_unix.go b/file_storage_unix.go
+new file mode 100644
+index 0000000..d75f66a
+--- /dev/null
++++ b/file_storage_unix.go
+@@ -0,0 +1,98 @@
++// Copyright (c) 2012, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// +build darwin dragonfly freebsd linux netbsd openbsd
++
++package storage
++
++import (
++	"os"
++	"syscall"
++)
++
++type unixFileLock struct {
++	f *os.File
++}
++
++func (fl *unixFileLock) release() error {
++	if err := setFileLock(fl.f, false, false); err != nil {
++		return err
++	}
++	return fl.f.Close()
++}
++
++func newFileLock(path string, readOnly bool) (fl fileLock, err error) {
++	var flag int
++	if readOnly {
++		flag = os.O_RDONLY
++	} else {
++		flag = os.O_RDWR
++	}
++	f, err := os.OpenFile(path, flag, 0)
++	if os.IsNotExist(err) {
++		f, err = os.OpenFile(path, flag|os.O_CREATE, 0644)
++	}
++	if err != nil {
++		return
++	}
++	err = setFileLock(f, readOnly, true)
++	if err != nil {
++		f.Close()
++		return
++	}
++	fl = &unixFileLock{f: f}
++	return
++}
++
++func setFileLock(f *os.File, readOnly, lock bool) error {
++	how := syscall.LOCK_UN
++	if lock {
++		if readOnly {
++			how = syscall.LOCK_SH
++		} else {
++			how = syscall.LOCK_EX
++		}
++	}
++	return syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
++}
++
++func rename(oldpath, newpath string) error {
++	return os.Rename(oldpath, newpath)
++}
++
++func isErrInvalid(err error) bool {
++	if err == os.ErrInvalid {
++		return true
++	}
++	// Go < 1.8
++	if syserr, ok := err.(*os.SyscallError); ok && syserr.Err == syscall.EINVAL {
++		return true
++	}
++	// Go >= 1.8 returns *os.PathError instead
++	if patherr, ok := err.(*os.PathError); ok && patherr.Err == syscall.EINVAL {
++		return true
++	}
++	return false
++}
++
++func syncDir(name string) error {
++	// As per fsync manpage, Linux seems to expect fsync on directory, however
++	// some system don't support this, so we will ignore syscall.EINVAL.
++	//
++	// From fsync(2):
++	//   Calling fsync() does not necessarily ensure that the entry in the
++	//   directory containing the file has also reached disk. For that an
++	//   explicit fsync() on a file descriptor for the directory is also needed.
++	f, err := os.Open(name)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	if err := f.Sync(); err != nil && !isErrInvalid(err) {
++		return err
++	}
++	return nil
++}
+diff --git a/file_storage_windows.go b/file_storage_windows.go
+new file mode 100644
+index 0000000..899335f
+--- /dev/null
++++ b/file_storage_windows.go
+@@ -0,0 +1,78 @@
++// Copyright (c) 2013, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package storage
++
++import (
++	"syscall"
++	"unsafe"
++)
++
++var (
++	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
++
++	procMoveFileExW = modkernel32.NewProc("MoveFileExW")
++)
++
++const (
++	_MOVEFILE_REPLACE_EXISTING = 1
++)
++
++type windowsFileLock struct {
++	fd syscall.Handle
++}
++
++func (fl *windowsFileLock) release() error {
++	return syscall.Close(fl.fd)
++}
++
++func newFileLock(path string, readOnly bool) (fl fileLock, err error) {
++	pathp, err := syscall.UTF16PtrFromString(path)
++	if err != nil {
++		return
++	}
++	var access, shareMode uint32
++	if readOnly {
++		access = syscall.GENERIC_READ
++		shareMode = syscall.FILE_SHARE_READ
++	} else {
++		access = syscall.GENERIC_READ | syscall.GENERIC_WRITE
++	}
++	fd, err := syscall.CreateFile(pathp, access, shareMode, nil, syscall.OPEN_EXISTING, syscall.FILE_ATTRIBUTE_NORMAL, 0)
++	if err == syscall.ERROR_FILE_NOT_FOUND {
++		fd, err = syscall.CreateFile(pathp, access, shareMode, nil, syscall.OPEN_ALWAYS, syscall.FILE_ATTRIBUTE_NORMAL, 0)
++	}
++	if err != nil {
++		return
++	}
++	fl = &windowsFileLock{fd: fd}
++	return
++}
++
++func moveFileEx(from *uint16, to *uint16, flags uint32) error {
++	r1, _, e1 := syscall.Syscall(procMoveFileExW.Addr(), 3, uintptr(unsafe.Pointer(from)), uintptr(unsafe.Pointer(to)), uintptr(flags))
++	if r1 == 0 {
++		if e1 != 0 {
++			return error(e1)
++		}
++		return syscall.EINVAL
++	}
++	return nil
++}
++
++func rename(oldpath, newpath string) error {
++	from, err := syscall.UTF16PtrFromString(oldpath)
++	if err != nil {
++		return err
++	}
++	to, err := syscall.UTF16PtrFromString(newpath)
++	if err != nil {
++		return err
++	}
++	return moveFileEx(from, to, _MOVEFILE_REPLACE_EXISTING)
++}
++
++func syncDir(name string) error { return nil }
+diff --git a/mem_storage.go b/mem_storage.go
+new file mode 100644
+index 0000000..838f1be
+--- /dev/null
++++ b/mem_storage.go
+@@ -0,0 +1,222 @@
++// Copyright (c) 2013, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package storage
++
++import (
++	"bytes"
++	"os"
++	"sync"
++)
++
++const typeShift = 4
++
++// Verify at compile-time that typeShift is large enough to cover all FileType
++// values by confirming that 0 == 0.
++var _ [0]struct{} = [TypeAll >> typeShift]struct{}{}
++
++type memStorageLock struct {
++	ms *memStorage
++}
++
++func (lock *memStorageLock) Unlock() {
++	ms := lock.ms
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	if ms.slock == lock {
++		ms.slock = nil
++	}
++	return
++}
++
++// memStorage is a memory-backed storage.
++type memStorage struct {
++	mu    sync.Mutex
++	slock *memStorageLock
++	files map[uint64]*memFile
++	meta  FileDesc
++}
++
++// NewMemStorage returns a new memory-backed storage implementation.
++func NewMemStorage() Storage {
++	return &memStorage{
++		files: make(map[uint64]*memFile),
++	}
++}
++
++func (ms *memStorage) Lock() (Locker, error) {
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	if ms.slock != nil {
++		return nil, ErrLocked
++	}
++	ms.slock = &memStorageLock{ms: ms}
++	return ms.slock, nil
++}
++
++func (*memStorage) Log(str string) {}
++
++func (ms *memStorage) SetMeta(fd FileDesc) error {
++	if !FileDescOk(fd) {
++		return ErrInvalidFile
++	}
++
++	ms.mu.Lock()
++	ms.meta = fd
++	ms.mu.Unlock()
++	return nil
++}
++
++func (ms *memStorage) GetMeta() (FileDesc, error) {
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	if ms.meta.Zero() {
++		return FileDesc{}, os.ErrNotExist
++	}
++	return ms.meta, nil
++}
++
++func (ms *memStorage) List(ft FileType) ([]FileDesc, error) {
++	ms.mu.Lock()
++	var fds []FileDesc
++	for x := range ms.files {
++		fd := unpackFile(x)
++		if fd.Type&ft != 0 {
++			fds = append(fds, fd)
++		}
++	}
++	ms.mu.Unlock()
++	return fds, nil
++}
++
++func (ms *memStorage) Open(fd FileDesc) (Reader, error) {
++	if !FileDescOk(fd) {
++		return nil, ErrInvalidFile
++	}
++
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	if m, exist := ms.files[packFile(fd)]; exist {
++		if m.open {
++			return nil, errFileOpen
++		}
++		m.open = true
++		return &memReader{Reader: bytes.NewReader(m.Bytes()), ms: ms, m: m}, nil
++	}
++	return nil, os.ErrNotExist
++}
++
++func (ms *memStorage) Create(fd FileDesc) (Writer, error) {
++	if !FileDescOk(fd) {
++		return nil, ErrInvalidFile
++	}
++
++	x := packFile(fd)
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	m, exist := ms.files[x]
++	if exist {
++		if m.open {
++			return nil, errFileOpen
++		}
++		m.Reset()
++	} else {
++		m = &memFile{}
++		ms.files[x] = m
++	}
++	m.open = true
++	return &memWriter{memFile: m, ms: ms}, nil
++}
++
++func (ms *memStorage) Remove(fd FileDesc) error {
++	if !FileDescOk(fd) {
++		return ErrInvalidFile
++	}
++
++	x := packFile(fd)
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	if _, exist := ms.files[x]; exist {
++		delete(ms.files, x)
++		return nil
++	}
++	return os.ErrNotExist
++}
++
++func (ms *memStorage) Rename(oldfd, newfd FileDesc) error {
++	if !FileDescOk(oldfd) || !FileDescOk(newfd) {
++		return ErrInvalidFile
++	}
++	if oldfd == newfd {
++		return nil
++	}
++
++	oldx := packFile(oldfd)
++	newx := packFile(newfd)
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	oldm, exist := ms.files[oldx]
++	if !exist {
++		return os.ErrNotExist
++	}
++	newm, exist := ms.files[newx]
++	if (exist && newm.open) || oldm.open {
++		return errFileOpen
++	}
++	delete(ms.files, oldx)
++	ms.files[newx] = oldm
++	return nil
++}
++
++func (*memStorage) Close() error { return nil }
++
++type memFile struct {
++	bytes.Buffer
++	open bool
++}
++
++type memReader struct {
++	*bytes.Reader
++	ms     *memStorage
++	m      *memFile
++	closed bool
++}
++
++func (mr *memReader) Close() error {
++	mr.ms.mu.Lock()
++	defer mr.ms.mu.Unlock()
++	if mr.closed {
++		return ErrClosed
++	}
++	mr.m.open = false
++	return nil
++}
++
++type memWriter struct {
++	*memFile
++	ms     *memStorage
++	closed bool
++}
++
++func (*memWriter) Sync() error { return nil }
++
++func (mw *memWriter) Close() error {
++	mw.ms.mu.Lock()
++	defer mw.ms.mu.Unlock()
++	if mw.closed {
++		return ErrClosed
++	}
++	mw.memFile.open = false
++	return nil
++}
++
++func packFile(fd FileDesc) uint64 {
++	return uint64(fd.Num)<<typeShift | uint64(fd.Type)
++}
++
++func unpackFile(x uint64) FileDesc {
++	return FileDesc{FileType(x) & TypeAll, int64(x >> typeShift)}
++}
+diff --git a/mem_storage_test.go b/mem_storage_test.go
+new file mode 100644
+index 0000000..bb0a19d
+--- /dev/null
++++ b/mem_storage_test.go
+@@ -0,0 +1,117 @@
++// Copyright (c) 2013, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++package storage
++
++import (
++	"bytes"
++	"fmt"
++	"testing"
++)
++
++func TestMemStorage(t *testing.T) {
++	m := NewMemStorage()
++
++	l, err := m.Lock()
++	if err != nil {
++		t.Fatal("storage lock failed(1): ", err)
++	}
++	_, err = m.Lock()
++	if err == nil {
++		t.Fatal("expect error for second storage lock attempt")
++	} else {
++		t.Logf("storage lock got error: %s (expected)", err)
++	}
++	l.Unlock()
++	_, err = m.Lock()
++	if err != nil {
++		t.Fatal("storage lock failed(2): ", err)
++	}
++
++	w, err := m.Create(FileDesc{TypeTable, 1})
++	if err != nil {
++		t.Fatal("Storage.Create: ", err)
++	}
++	w.Write([]byte("abc"))
++	w.Close()
++	if fds, _ := m.List(TypeAll); len(fds) != 1 {
++		t.Fatal("invalid GetFiles len")
++	}
++	buf := new(bytes.Buffer)
++	r, err := m.Open(FileDesc{TypeTable, 1})
++	if err != nil {
++		t.Fatal("Open: got error: ", err)
++	}
++	buf.ReadFrom(r)
++	r.Close()
++	if got := buf.String(); got != "abc" {
++		t.Fatalf("Read: invalid value, want=abc got=%s", got)
++	}
++	if _, err := m.Open(FileDesc{TypeTable, 1}); err != nil {
++		t.Fatal("Open: got error: ", err)
++	}
++	if _, err := m.Open(FileDesc{TypeTable, 1}); err == nil {
++		t.Fatal("expecting error")
++	}
++	m.Remove(FileDesc{TypeTable, 1})
++	if fds, _ := m.List(TypeAll); len(fds) != 0 {
++		t.Fatal("invalid GetFiles len", len(fds))
++	}
++	if _, err := m.Open(FileDesc{TypeTable, 1}); err == nil {
++		t.Fatal("expecting error")
++	}
++}
++
++func TestMemStorageRename(t *testing.T) {
++	fd1 := FileDesc{Type: TypeTable, Num: 1}
++	fd2 := FileDesc{Type: TypeTable, Num: 2}
++
++	m := NewMemStorage()
++	w, err := m.Create(fd1)
++	if err != nil {
++		t.Fatalf("Storage.Create: %v", err)
++	}
++
++	fmt.Fprintf(w, "abc")
++	w.Close()
++
++	rd, err := m.Open(fd1)
++	if err != nil {
++		t.Fatalf("Storage.Open(%v): %v", fd1, err)
++	}
++	rd.Close()
++
++	fds, err := m.List(TypeAll)
++	if err != nil {
++		t.Fatalf("Storage.List: %v", err)
++	}
++	for _, fd := range fds {
++		if !FileDescOk(fd) {
++			t.Errorf("Storage.List -> FileDescOk(%q)", fd)
++		}
++	}
++
++	err = m.Rename(fd1, fd2)
++	if err != nil {
++		t.Fatalf("Storage.Rename: %v", err)
++	}
++
++	rd, err = m.Open(fd2)
++	if err != nil {
++		t.Fatalf("Storage.Open(%v): %v", fd2, err)
++	}
++	rd.Close()
++
++	fds, err = m.List(TypeAll)
++	if err != nil {
++		t.Fatalf("Storage.List: %v", err)
++	}
++	for _, fd := range fds {
++		if !FileDescOk(fd) {
++			t.Errorf("Storage.List -> FileDescOk(%q)", fd)
++		}
++	}
++}
+diff --git a/storage.go b/storage.go
+new file mode 100644
+index 0000000..89d7046
+--- /dev/null
++++ b/storage.go
+@@ -0,0 +1,187 @@
++// Copyright (c) 2012, Suryandaru Triandana <syndtr@gmail.com>
++// All rights reserved.
++//
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Package storage provides storage abstraction for LevelDB.
++package storage
++
++import (
++	"errors"
++	"fmt"
++	"io"
++)
++
++// FileType represent a file type.
++type FileType int
++
++// File types.
++const (
++	TypeManifest FileType = 1 << iota
++	TypeJournal
++	TypeTable
++	TypeTemp
++
++	TypeAll = TypeManifest | TypeJournal | TypeTable | TypeTemp
++)
++
++func (t FileType) String() string {
++	switch t {
++	case TypeManifest:
++		return "manifest"
++	case TypeJournal:
++		return "journal"
++	case TypeTable:
++		return "table"
++	case TypeTemp:
++		return "temp"
++	}
++	return fmt.Sprintf("<unknown:%d>", t)
++}
++
++// FileDesc is a 'file descriptor'.
++type FileDesc struct {
++	Type FileType
++	Num  int64
++}
++
++func (fd FileDesc) String() string {
++	switch fd.Type {
++	case TypeManifest:
++		return fmt.Sprintf("MANIFEST-%06d", fd.Num)
++	case TypeJournal:
++		return fmt.Sprintf("%06d.log", fd.Num)
++	case TypeTable:
++		return fmt.Sprintf("%06d.ldb", fd.Num)
++	case TypeTemp:
++		return fmt.Sprintf("%06d.tmp", fd.Num)
++	default:
++		return fmt.Sprintf("%#x-%d", fd.Type, fd.Num)
++	}
++}
++
++// Zero returns true if fd == (FileDesc{}).
++func (fd FileDesc) Zero() bool {
++	return fd == (FileDesc{})
++}
++
++// FileDescOk returns true if fd is a valid 'file descriptor'.
++func FileDescOk(fd FileDesc) bool {
++	switch fd.Type {
++	case TypeManifest:
++	case TypeJournal:
++	case TypeTable:
++	case TypeTemp:
++	default:
++		return false
++	}
++	return fd.Num >= 0
++}
++
++// Common error.
++var (
++	ErrInvalidFile = errors.New("leveldb/storage: invalid file for argument")
++	ErrLocked      = errors.New("leveldb/storage: already locked")
++	ErrClosed      = errors.New("leveldb/storage: closed")
++)
++
++// ErrCorrupted is the type that wraps errors that indicate corruption of
++// a file. Package storage has its own type instead of using
++// errors.ErrCorrupted to prevent circular import.
++type ErrCorrupted struct {
++	Fd  FileDesc
++	Err error
++}
++
++func (e *ErrCorrupted) Error() string {
++	if !e.Fd.Zero() {
++		return fmt.Sprintf("%v [file=%v]", e.Err, e.Fd)
++	}
++	return e.Err.Error()
++}
++
++func isCorrupted(err error) bool {
++	switch err.(type) {
++	case *ErrCorrupted:
++		return true
++	}
++	return false
++}
++
++// Locker is the interface that wraps Unlock method.
++type Locker interface {
++	Unlock()
++}
++
++// Syncer is the interface that wraps basic Sync method.
++type Syncer interface {
++	// Sync commits the current contents of the file to stable storage.
++	Sync() error
++}
++
++// Reader is the interface that groups the basic Read, Seek, ReadAt and Close
++// methods.
++type Reader interface {
++	io.ReadSeeker
++	io.ReaderAt
++	io.Closer
++}
++
++// Writer is the interface that groups the basic Write, Sync and Close
++// methods.
++type Writer interface {
++	io.WriteCloser
++	Syncer
++}
++
++// Storage is the storage. A storage instance must be safe for concurrent use.
++type Storage interface {
++	// Lock locks the storage. Any subsequent attempt to call Lock will fail
++	// until the last lock released.
++	// Caller should call Unlock method after use.
++	Lock() (Locker, error)
++
++	// Log logs a string. This is used for logging.
++	// An implementation may write to a file, stdout or simply do nothing.
++	Log(str string)
++
++	// SetMeta store 'file descriptor' that can later be acquired using GetMeta
++	// method. The 'file descriptor' should point to a valid file.
++	// SetMeta should be implemented in such way that changes should happen
++	// atomically.
++	SetMeta(fd FileDesc) error
++
++	// GetMeta returns 'file descriptor' stored in meta. The 'file descriptor'
++	// can be updated using SetMeta method.
++	// Returns os.ErrNotExist if meta doesn't store any 'file descriptor', or
++	// 'file descriptor' point to nonexistent file.
++	GetMeta() (FileDesc, error)
++
++	// List returns file descriptors that match the given file types.
++	// The file types may be OR'ed together.
++	List(ft FileType) ([]FileDesc, error)
++
++	// Open opens file with the given 'file descriptor' read-only.
++	// Returns os.ErrNotExist error if the file does not exist.
++	// Returns ErrClosed if the underlying storage is closed.
++	Open(fd FileDesc) (Reader, error)
++
++	// Create creates file with the given 'file descriptor', truncate if already
++	// exist and opens write-only.
++	// Returns ErrClosed if the underlying storage is closed.
++	Create(fd FileDesc) (Writer, error)
++
++	// Remove removes file with the given 'file descriptor'.
++	// Returns ErrClosed if the underlying storage is closed.
++	Remove(fd FileDesc) error
++
++	// Rename renames file from oldfd to newfd.
++	// Returns ErrClosed if the underlying storage is closed.
++	Rename(oldfd, newfd FileDesc) error
++
++	// Close closes the storage.
++	// It is valid to call Close multiple times. Other methods should not be
++	// called after the storage has been closed.
++	Close() error
++}
+-- 
+2.6.2
+
